@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var isPlaying = false
     @State private var isMuxQuickTestSelected = false
     @State private var userRequestedStop = false
+    @State private var showRendererMetrics = true
 
 #if os(visionOS)
     init(rendererConfiguration: Video3DConfiguration) {
@@ -36,6 +37,7 @@ struct ContentView: View {
                     hlsURL: url,
                     isPlaying: $isPlaying,
                     rendererConfiguration: rendererConfiguration,
+                    showRendererMetrics: showRendererMetrics,
                     autoOpenImmersiveOnAppear: isMuxQuickTestSelected,
                     onUserStop: {
                         userRequestedStop = true
@@ -45,63 +47,102 @@ struct ContentView: View {
                 StereoVideoPlayerView(hlsURL: url, isPlaying: $isPlaying)
 #endif
             } else {
-                VStack(spacing: 24) {
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.08, green: 0.12, blue: 0.20),
+                        Color(red: 0.03, green: 0.05, blue: 0.10),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+
+                Circle()
+                    .fill(Color.cyan.opacity(0.18))
+                    .frame(width: 380, height: 380)
+                    .blur(radius: 36)
+                    .offset(x: -180, y: -220)
+
+                Circle()
+                    .fill(Color.blue.opacity(0.22))
+                    .frame(width: 320, height: 320)
+                    .blur(radius: 32)
+                    .offset(x: 180, y: 180)
+
+                VStack(spacing: 18) {
                     VStack(spacing: 12) {
-                        Image(systemName: "video.fill")
-                            .font(.system(size: 48))
-                            .foregroundColor(.blue)
-                        
+                        Image(systemName: "play.rectangle.fill")
+                            .font(.system(size: 40, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(12)
+                            .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
                         Text("DepthPlayer")
-                            .font(.system(size: 32, weight: .bold))
-                        
-                        Text("2D to 3D HLS Streaming")
-                            .font(.system(size: 16))
-                            .foregroundColor(.gray)
+                            .font(.system(size: 34, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+
+                        Text("Spatial 2D to 3D streaming")
+                            .font(.system(size: 15, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.82))
                     }
-                    
-                    VStack(spacing: 8) {
-                        Text("Powered by Depth Anything V2")
-                            .font(.system(size: 14, weight: .semibold))
-                        Text("Real-time monocular depth estimation + stereo synthesis")
-                            .font(.system(size: 12))
-                            .foregroundColor(.gray)
-                            .multilineTextAlignment(.center)
-                    }
-                    .padding(16)
-                    .background(Color.gray.opacity(0.1))
-                    .cornerRadius(8)
-                    
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 22)
+                    .padding(.horizontal, 20)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .stroke(Color.white.opacity(0.22), lineWidth: 1)
+                    )
+
                     Button(action: { showURLInput = true }) {
                         Label("Load HLS Stream", systemImage: "plus.circle.fill")
                             .frame(maxWidth: .infinity)
-                            .padding(12)
-                            .background(Color.blue)
+                            .padding(.vertical, 14)
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                            .background(Color.white.opacity(0.2))
                             .foregroundColor(.white)
-                            .cornerRadius(8)
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }
-                    
+
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Quick Test URLs")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.gray)
-                        
+                        Text("Quick Test")
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundColor(.white.opacity(0.7))
+
                         Button(action: {
                             isMuxQuickTestSelected = true
                             streamURL = URL(string: muxTestURLString)
                         }) {
                             HStack {
-                                Text("Mux Test Stream")
+                                Text("RAW - Big Buck Bunny HLS Test Stream")
+                                    .font(.system(size: 14, weight: .semibold, design: .rounded))
                                 Spacer()
                                 Image(systemName: "arrow.right")
                             }
-                            .padding(10)
-                            .background(isMuxQuickTestSelected ? Color.green : Color.gray.opacity(0.1))
+                            .padding(12)
+                            .background(isMuxQuickTestSelected ? Color.green.opacity(0.82) : Color.white.opacity(0.12))
                             .foregroundColor(isMuxQuickTestSelected ? .white : .blue)
-                            .cornerRadius(6)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         }
+
+                        Toggle("Show sec / vf / rf / df", isOn: $showRendererMetrics)
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundColor(.white)
+                            .tint(.blue)
                     }
+                    .padding(14)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+
+                    Text("Powered by Depth Anything V2 · AVPlayer")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.66))
                 }
-                .padding(32)
+                .padding(28)
+                .frame(maxWidth: 620)
                 .sheet(isPresented: $showURLInput) {
                     URLInputView(streamURL: $streamURL, onLoad: {
                         isMuxQuickTestSelected = false
@@ -133,13 +174,16 @@ struct URLInputView: View {
             VStack(spacing: 16) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Stream URL")
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.9))
                     
                     TextField("https://...", text: $input)
                         .textFieldStyle(.roundedBorder)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 }
+                .padding(14)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 
                 HStack(spacing: 12) {
                     Button("Cancel") {
@@ -147,8 +191,9 @@ struct URLInputView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(10)
-                    .background(Color.gray.opacity(0.2))
-                    .cornerRadius(6)
+                    .background(Color.white.opacity(0.14))
+                    .cornerRadius(10)
+                    .foregroundColor(.white)
                     
                     Button("Load") {
                         if let url = URL(string: input) {
@@ -159,15 +204,22 @@ struct URLInputView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(10)
-                    .background(Color.blue)
+                    .background(Color.blue.opacity(0.85))
                     .foregroundColor(.white)
-                    .cornerRadius(6)
+                    .cornerRadius(10)
                     .disabled(input.isEmpty)
                 }
                 
                 Spacer()
             }
             .padding(16)
+            .background(
+                LinearGradient(
+                    colors: [Color(red: 0.06, green: 0.09, blue: 0.16), Color(red: 0.03, green: 0.05, blue: 0.10)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
             .navigationTitle("Enter Stream URL")
             .navigationBarTitleDisplayMode(.inline)
         }

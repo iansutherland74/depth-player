@@ -19,11 +19,17 @@ struct DepthPlayerApp: App {
 #if os(visionOS)
             ContentView(rendererConfiguration: rendererConfiguration)
             .environmentObject(stereoPresentation)
+        .glassBackgroundEffect(displayMode: .never)
 #else
             ContentView()
             .environmentObject(stereoPresentation)
 #endif
         }
+#if os(visionOS)
+    .windowStyle(.plain)
+        .windowResizability(.contentSize)
+    .defaultSize(width: 460, height: 180)
+#endif
 
 #if os(visionOS)
         ImmersiveSpace(id: "DepthPlayerStereoImmersive") {

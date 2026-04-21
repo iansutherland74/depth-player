@@ -19,6 +19,7 @@ struct StereoProcessedFrame {
 final class StereoPresentationCoordinator: ObservableObject {
     @Published private(set) var renderer: AVSampleBufferVideoRenderer?
     @Published private(set) var immersiveStatus: String = "Preparing immersive stereo playback..."
+    @Published private(set) var stopRequestID: Int = 0
 
     func attach(renderer: AVSampleBufferVideoRenderer) {
         self.renderer = renderer
@@ -32,6 +33,10 @@ final class StereoPresentationCoordinator: ObservableObject {
 
     func setStatus(_ status: String) {
         immersiveStatus = status
+    }
+
+    func requestStopPlayback() {
+        stopRequestID += 1
     }
 }
 
@@ -356,7 +361,7 @@ final class StereoFrameProcessor: @unchecked Sendable {
 }
 
 @MainActor
-final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerItemOutputPullDelegate {
+final class StereoVideoPlayerController: NSObject, ObservableObject {
     @Published var isRunning = false
     @Published var lastError: String?
     @Published var loadingMessage: String?
@@ -367,9 +372,7 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
     
     private let processor: StereoFrameProcessor
     private let stereoBridge = StereoSampleBufferBridge()
-    private let processingVideoOutput: AVPlayerItemVideoOutput
-    private let rendererVideoOutput: AVPlayerItemVideoOutput
-    private let outputDelegateQueue = DispatchQueue(label: "com.vision.depthplayer.video-output", qos: .userInitiated)
+    private let playerVideoOutput: AVPlayerVideoOutput
     private let processingQueue = DispatchQueue(label: "com.vision.depthplayer.processing", qos: .userInitiated)
     
     private var displayLink: CADisplayLink?
@@ -394,15 +397,12 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
     private var lastReportedDebugState = "idle"
     private var lastHighFrequencyStateLoggedSecond = -1
     private var lastNoisyStateLoggedSecond = -1
-    private var mediaDataChangeRequested = false
-    private var lastMediaDataChangeRequestHostTime = 0.0
-    private var mediaDataChangeRequestCount: UInt64 = 0
-    private var mediaDataWillChangeCount: UInt64 = 0
-    private var outputRebindCount: UInt64 = 0
-    private var lastOutputRebindHostTime = 0.0
+    private var lastProcessedPresentationTime: CMTime = .invalid
     private var lastLoopRestartHostTime = 0.0
     private var lastDetailedDiagnosticsSecond = -1
     private var hasProducedFirstFrame = false
+    private var startupHostTime = 0.0
+    private var lastStartupTimelineNudgeHostTime = 0.0
     private var noFrameIntervalState: OSSignpostIntervalState?
     private var startupIntervalState: OSSignpostIntervalState?
     private var lastFrameProcessHostTime = 0.0
@@ -429,20 +429,20 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
             temporalSmoothing: temporalSmoothing
         )
         
-        let attrs: [String: Any] = [
+        // Build AVVideoOutputSpecification for monoscopic (2D) content.
+        // kCMStereoView_None = CMStereoViewComponents() — no stereo eyes, i.e. regular 2D.
+        let monoTag = CMTag.stereoView(CMStereoViewComponents())
+        let spec = AVVideoOutputSpecification(tagCollections: [[monoTag]])
+        spec.defaultPixelBufferAttributes = [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
             kCVPixelBufferMetalCompatibilityKey as String: true,
         ]
-        self.processingVideoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: attrs)
-        self.processingVideoOutput.suppressesPlayerRendering = false
-        // Share a single output object between Swift processing and compositor renderer
-        // to avoid duplicate output queues and decoder-side buffering growth.
-        self.rendererVideoOutput = self.processingVideoOutput
-        
-        super.init()
+        self.playerVideoOutput = AVPlayerVideoOutput(specification: spec)
 
-        self.processingVideoOutput.setDelegate(self, queue: outputDelegateQueue)
-        
+        super.init()
+        // Attach to player (not per-item) — no rebinding needed across item transitions.
+        player.videoOutput = self.playerVideoOutput
+
         player.actionAtItemEnd = .none
         player.automaticallyWaitsToMinimizeStalling = false
         configureObservers()
@@ -472,12 +472,7 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
         if let itemAccessLogObserver {
             NotificationCenter.default.removeObserver(itemAccessLogObserver)
         }
-        if let observedItem {
-            observedItem.remove(processingVideoOutput)
-            if rendererVideoOutput !== processingVideoOutput {
-                observedItem.remove(rendererVideoOutput)
-            }
-        }
+        player.videoOutput = nil
         NotificationCenter.default.removeObserver(self)
     }
     
@@ -488,16 +483,19 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
         lastError = nil
         playbackSeconds = 0
         hasProducedFirstFrame = false
+        startupHostTime = CACurrentMediaTime()
+        lastStartupTimelineNudgeHostTime = 0
         lastDeliveredFrameHostTime = CACurrentMediaTime()
         lastAutoResumeAttemptHostTime = 0
         lastObservedItemTimeSeconds = -1
         unchangedItemTimeTicks = 0
+        lastProcessedPresentationTime = .invalid
         setPlaybackDebugState("started")
         PlaybackFaultLogger.shared.log("controller-start")
         startupIntervalState = signposter.beginInterval("StartupToFirstFrame", id: signposter.makeSignpostID())
         signposter.emitEvent("ControllerStart", id: signposter.makeSignpostID())
         
-        player.play()
+        player.playImmediately(atRate: 1.0)
         
 #if os(visionOS)
         let link = CADisplayLink(target: self, selector: #selector(step))
@@ -544,15 +542,15 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
 
 #if os(visionOS)
     func attachRendererConfiguration(_ configuration: Video3DConfiguration) {
-        configuration.videoOutput = rendererVideoOutput
-        configuration.rendererDebugStatus = "Player attached dedicated renderer AVPlayerItemVideoOutput"
+        configuration.playerVideoOutput = playerVideoOutput
+        configuration.rendererDebugStatus = "Player attached AVPlayerVideoOutput"
     }
 
     func detachRendererConfiguration(_ configuration: Video3DConfiguration) {
-        if configuration.videoOutput === rendererVideoOutput {
-            configuration.videoOutput = nil
+        if configuration.playerVideoOutput === playerVideoOutput {
+            configuration.playerVideoOutput = nil
         }
-        configuration.rendererDebugStatus = "Player detached AVPlayerItemVideoOutput"
+        configuration.rendererDebugStatus = "Player detached AVPlayerVideoOutput"
     }
 #endif
     
@@ -572,22 +570,82 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
     
     @objc private func step() {
         let hostTime = CACurrentMediaTime()
-        let itemTime = processingVideoOutput.itemTime(forHostTime: hostTime)
-        let elapsed = CMTimeGetSeconds(itemTime)
-        if elapsed.isFinite && elapsed >= 0 {
-            playbackSeconds = elapsed
+        let hostCMTime = CMTime(seconds: hostTime, preferredTimescale: 1_000_000)
+
+        // Pull frame from AVPlayerVideoOutput (player-level, no per-item rebinding needed).
+        // taggedBuffers(forHostTime:) returns the frame appropriate for the given host time.
+        let frameResult = playerVideoOutput.taggedBuffers(forHostTime: hostCMTime)
+
+        let playerTime = player.currentTime()
+        let rawPresentationTime = frameResult?.presentationTime
+        let resolvedFrameTime: CMTime
+        let mediaClockSeconds: Double?
+        if let rawPresentationTime, rawPresentationTime.isValid, rawPresentationTime != .zero {
+            // Prefer whichever clock is advancing. Some outputs keep a repeated presentation time.
+            if playerTime.isValid, playerTime != .invalid, playerTime != .zero {
+                let rawSeconds = CMTimeGetSeconds(rawPresentationTime)
+                let playerSeconds = CMTimeGetSeconds(playerTime)
+                if rawSeconds.isFinite, playerSeconds.isFinite, playerSeconds > rawSeconds + 0.001 {
+                    resolvedFrameTime = playerTime
+                    mediaClockSeconds = playerSeconds
+                } else {
+                    resolvedFrameTime = rawPresentationTime
+                    mediaClockSeconds = rawSeconds.isFinite ? rawSeconds : nil
+                }
+            } else {
+                resolvedFrameTime = rawPresentationTime
+                let rawSeconds = CMTimeGetSeconds(rawPresentationTime)
+                mediaClockSeconds = rawSeconds.isFinite ? rawSeconds : nil
+            }
+        } else if playerTime.isValid,
+                  playerTime != .invalid,
+                  playerTime != .zero {
+            resolvedFrameTime = playerTime
+            let playerSeconds = CMTimeGetSeconds(playerTime)
+            mediaClockSeconds = playerSeconds.isFinite ? playerSeconds : nil
+        } else {
+            // Do not use host uptime as media time; it can trigger false end-of-item handling.
+            resolvedFrameTime = .invalid
+            mediaClockSeconds = nil
         }
-        emitDiagnosticsIfNeeded(hostTime: hostTime, itemTime: itemTime)
-        let itemSeconds = CMTimeGetSeconds(itemTime)
-        if itemSeconds.isFinite && itemSeconds >= 0 {
-            if abs(itemSeconds - lastObservedItemTimeSeconds) < 0.0001 {
+
+        // Update playback time only from media clocks (player/item output), never host uptime.
+        if let mediaClockSeconds, mediaClockSeconds >= 0 {
+            playbackSeconds = mediaClockSeconds
+            if abs(mediaClockSeconds - lastObservedItemTimeSeconds) < 0.0001 {
                 unchangedItemTimeTicks += 1
             } else {
                 unchangedItemTimeTicks = 0
-                lastObservedItemTimeSeconds = itemSeconds
+                lastObservedItemTimeSeconds = mediaClockSeconds
             }
         }
 
+        emitDiagnosticsIfNeeded(hostTime: hostTime, hasFrame: frameResult != nil)
+
+        // Startup watchdog: if timeline remains pinned at 0, force a gentle timeline nudge.
+        if isRunning,
+           hostTime - startupHostTime > 2.0,
+           playbackSeconds < 0.01,
+           let item = player.currentItem,
+           item.status == .readyToPlay,
+           hasProducedFirstFrame,
+           hostTime - lastStartupTimelineNudgeHostTime > 2.0 {
+            lastStartupTimelineNudgeHostTime = hostTime
+            PlaybackFaultLogger.shared.log("startup-zero-time-nudge", fields: [
+                "seconds": String(Int(playbackSeconds)),
+                "rate": String(format: "%.2f", player.rate),
+            ])
+            player.seek(to: CMTime(value: 1, timescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.player.playImmediately(atRate: 1.0)
+                    self?.setPlaybackDebugState("startup-timeline-nudged")
+                }
+            }
+        }
+
+        let itemSeconds = CMTimeGetSeconds(playerTime)
+
+        // Duration-boundary loop detection using player timeline only.
         if let item = player.currentItem {
             let durationSeconds = CMTimeGetSeconds(item.duration)
             if durationSeconds.isFinite, durationSeconds > 0,
@@ -596,49 +654,39 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
                 return
             }
         }
-        
-          guard processingVideoOutput.hasNewPixelBuffer(forItemTime: itemTime),
-              let pixelBuffer = processingVideoOutput.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else {
+
+        guard let frameResult else {
             if isRunning {
                 let now = CACurrentMediaTime()
-                if !mediaDataChangeRequested {
-                    if now - lastMediaDataChangeRequestHostTime > 0.5 {
-                        mediaDataChangeRequested = true
-                        lastMediaDataChangeRequestHostTime = now
-                        mediaDataChangeRequestCount &+= 1
-                        processingVideoOutput.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
-                        setPlaybackDebugState("request-media-data-change")
-                        if mediaDataChangeRequestCount % 25 == 0 {
-                            PlaybackFaultLogger.shared.log("media-data-change-request-count", fields: [
-                                "count": String(mediaDataChangeRequestCount),
-                                "seconds": String(Int(playbackSeconds)),
-                            ])
-                            logPlaybackSnapshot(context: "media-change-request-count")
-                        }
-                    } else {
-                        setPlaybackDebugState("request-media-data-change-throttled")
-                    }
-                }
                 if noFrameIntervalState == nil {
                     noFrameIntervalState = signposter.beginInterval("NoFrameGap", id: signposter.makeSignpostID())
                 }
                 if unchangedItemTimeTicks > 90 {
                     setPlaybackDebugState("item-time-not-advancing")
-                    maybeRebindVideoOutput(context: "item-time-not-advancing")
                     if unchangedItemTimeTicks % 180 == 0 {
                         logPlaybackSnapshot(context: "item-time-not-advancing")
                     }
+                    if unchangedItemTimeTicks > 150 && isNearItemEnd() {
+                        maybeRestartEndedItem(reason: "stalled-near-end")
+                        return
+                    }
                 }
                 if now - lastDeliveredFrameHostTime > 6.0 {
-                    maybeRebindVideoOutput(context: "no-frames-timeout")
                     recoverPlayback(reason: "no-frames")
                 }
             }
             return
         }
 
+        // Deduplicate: skip if same presentation time as the last processed frame.
+          if resolvedFrameTime.isValid,
+              resolvedFrameTime != .zero,
+              resolvedFrameTime == lastProcessedPresentationTime {
+            return
+        }
+        lastProcessedPresentationTime = resolvedFrameTime
+
         lastDeliveredFrameHostTime = CACurrentMediaTime()
-        mediaDataChangeRequested = false
         if let noFrameIntervalState {
             signposter.endInterval("NoFrameGap", noFrameIntervalState)
             self.noFrameIntervalState = nil
@@ -652,12 +700,33 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
         }
         lastFrameProcessHostTime = hostTime
 
-        if isProcessingFrame {
-            pendingFrame = PendingFrame(pixelBuffer: pixelBuffer, itemTime: itemTime)
+        // Extract CVPixelBuffer from the tagged buffer group.
+        // AVPlayerVideoOutput may surface either direct pixel buffers or sample buffers.
+        var pixelBuffer: CVPixelBuffer?
+        for taggedBuffer in frameResult.taggedBufferGroup {
+            if case .pixelBuffer(let pb) = taggedBuffer.buffer {
+                pixelBuffer = pb
+                break
+            }
+            if case .sampleBuffer(let sb) = taggedBuffer.buffer,
+               let pb = CMSampleBufferGetImageBuffer(sb) {
+                pixelBuffer = pb
+                break
+            }
+        }
+        guard let pixelBuffer else {
+            setPlaybackDebugState("tagged-buffer-no-cvpixelbuffer")
             return
         }
 
-        processFrame(pixelBuffer, itemTime: itemTime)
+        let frameTimeForProcessing = (resolvedFrameTime.isValid && resolvedFrameTime != .zero) ? resolvedFrameTime : hostCMTime
+
+        if isProcessingFrame {
+            pendingFrame = PendingFrame(pixelBuffer: pixelBuffer, itemTime: frameTimeForProcessing)
+            return
+        }
+
+        processFrame(pixelBuffer, itemTime: frameTimeForProcessing)
     }
 
     private func configureObservers() {
@@ -671,13 +740,6 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
 
     private func bindCurrentItem(_ item: AVPlayerItem?) {
         guard item !== observedItem else { return }
-
-        if let observedItem {
-            observedItem.remove(processingVideoOutput)
-            if rendererVideoOutput !== processingVideoOutput {
-                observedItem.remove(rendererVideoOutput)
-            }
-        }
 
         itemStatusObservation?.invalidate()
         bufferEmptyObservation?.invalidate()
@@ -709,22 +771,18 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
         // as the compositor and depth pipeline.
         item.preferredForwardBufferDuration = 1.0
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
-
-        item.add(processingVideoOutput)
-        if rendererVideoOutput !== processingVideoOutput {
-            item.add(rendererVideoOutput)
-        }
-        mediaDataChangeRequested = false
-        lastMediaDataChangeRequestHostTime = 0
-        mediaDataChangeRequestCount = 0
-        processingVideoOutput.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
+        // Prefer 4K variants when the stream ladder provides them.
+        item.preferredMaximumResolution = CGSize(width: 3840, height: 2160)
+        item.preferredPeakBitRate = 120_000_000
 
         itemEndObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
             queue: .main
         ) { [weak self] _ in
-            self?.loopIfNeeded()
+            Task { @MainActor [weak self] in
+                self?.loopIfNeeded()
+            }
         }
 
         itemStallObserver = NotificationCenter.default.addObserver(
@@ -732,7 +790,9 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
             object: item,
             queue: .main
         ) { [weak self] _ in
-            self?.handlePlaybackStalled()
+            Task { @MainActor [weak self] in
+                self?.handlePlaybackStalled()
+            }
         }
 
         itemFailedToEndObserver = NotificationCenter.default.addObserver(
@@ -740,7 +800,9 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
             object: item,
             queue: .main
         ) { [weak self] _ in
-            self?.handleFailedToPlayToEnd()
+            Task { @MainActor [weak self] in
+                self?.handleFailedToPlayToEnd()
+            }
         }
 
         itemErrorLogObserver = NotificationCenter.default.addObserver(
@@ -748,9 +810,11 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
             object: item,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            let message = item.errorLog()?.events.last?.errorComment ?? "unknown"
-            self.setPlaybackDebugState("error-log: \(message)")
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let message = item.errorLog()?.events.last?.errorComment ?? "unknown"
+                self.setPlaybackDebugState("error-log: \(message)")
+            }
         }
 
         itemAccessLogObserver = NotificationCenter.default.addObserver(
@@ -758,7 +822,9 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
             object: item,
             queue: .main
         ) { [weak self] _ in
-            self?.setPlaybackDebugState("access-log-update")
+            Task { @MainActor [weak self] in
+                self?.setPlaybackDebugState("access-log-update")
+            }
         }
 
         itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
@@ -842,6 +908,12 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
             return
         }
 
+        if isNearItemEnd() {
+            setPlaybackDebugState("recover-near-end-\(reason)")
+            maybeRestartEndedItem(reason: "recover-\(reason)-near-end")
+            return
+        }
+
         let now = CACurrentMediaTime()
         guard now - lastAutoResumeAttemptHostTime >= 1.5 else { return }
         lastAutoResumeAttemptHostTime = now
@@ -852,7 +924,7 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
             PlaybackFaultLogger.shared.log("recover-playback", fields: ["reason": reason])
             logPlaybackSnapshot(context: "recover-\(reason)")
             signposter.emitEvent("RecoverPlayback", id: signposter.makeSignpostID())
-            player.play()
+            player.playImmediately(atRate: 1.0)
             #if DEBUG
             print("DepthPlayer: auto-resume triggered (\(reason))")
             #endif
@@ -936,33 +1008,6 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
         }
     }
 
-    nonisolated func outputMediaDataWillChange(_ sender: AVPlayerItemOutput) {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.mediaDataChangeRequested = false
-            self.mediaDataWillChangeCount &+= 1
-            self.lastDeliveredFrameHostTime = CACurrentMediaTime()
-            self.setPlaybackDebugState("media-data-will-change")
-            if self.mediaDataWillChangeCount % 25 == 0 {
-                PlaybackFaultLogger.shared.log("media-data-will-change-count", fields: [
-                    "count": String(self.mediaDataWillChangeCount),
-                    "seconds": String(Int(self.playbackSeconds)),
-                ])
-                self.logPlaybackSnapshot(context: "media-data-will-change-count")
-            }
-            self.signposter.emitEvent("MediaDataWillChange", id: self.signposter.makeSignpostID())
-        }
-    }
-
-    nonisolated func outputSequenceWasFlushed(_ output: AVPlayerItemOutput) {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.mediaDataChangeRequested = false
-            self.setPlaybackDebugState("output-sequence-flushed")
-            self.signposter.emitEvent("OutputSequenceFlushed", id: self.signposter.makeSignpostID())
-        }
-    }
-
     private func logPlaybackSnapshot(context: String) {
         guard let item = player.currentItem else {
             PlaybackFaultLogger.shared.log("playback-snapshot", fields: [
@@ -974,9 +1019,6 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
 
         let currentTime = item.currentTime().seconds
         let duration = item.duration.seconds
-        let hostNow = CACurrentMediaTime()
-        let outputTime = processingVideoOutput.itemTime(forHostTime: hostNow).seconds
-        let hasNewBuffer = processingVideoOutput.hasNewPixelBuffer(forItemTime: processingVideoOutput.itemTime(forHostTime: hostNow))
 
         let waitingReason: String
         if let reason = player.reasonForWaitingToPlay {
@@ -1010,41 +1052,12 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
             "rate": String(format: "%.2f", player.rate),
             "current_s": String(format: "%.2f", currentTime.isFinite ? currentTime : -1),
             "duration_s": String(format: "%.2f", duration.isFinite ? duration : -1),
-            "output_s": String(format: "%.2f", outputTime.isFinite ? outputTime : -1),
+            "presentation_s": String(format: "%.2f", lastProcessedPresentationTime.isValid ? CMTimeGetSeconds(lastProcessedPresentationTime) : -1),
             "buffer_empty": item.isPlaybackBufferEmpty ? "true" : "false",
             "likely_to_keep_up": item.isPlaybackLikelyToKeepUp ? "true" : "false",
-            "has_new_buffer": hasNewBuffer ? "true" : "false",
             "loaded_ranges": loadedRanges.isEmpty ? "none" : loadedRanges,
             "access": accessSummary,
-            "request_count": String(mediaDataChangeRequestCount),
-            "will_change_count": String(mediaDataWillChangeCount),
-            "rebind_count": String(outputRebindCount),
         ])
-    }
-
-    private func maybeRebindVideoOutput(context: String) {
-        guard let item = player.currentItem else { return }
-        guard player.timeControlStatus == .playing else { return }
-        guard item.isPlaybackLikelyToKeepUp else { return }
-        guard !item.isPlaybackBufferEmpty else { return }
-
-        let now = CACurrentMediaTime()
-        guard now - lastOutputRebindHostTime > 4.0 else { return }
-        lastOutputRebindHostTime = now
-        outputRebindCount &+= 1
-
-        item.remove(processingVideoOutput)
-        item.add(processingVideoOutput)
-        mediaDataChangeRequested = false
-        processingVideoOutput.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
-
-        PlaybackFaultLogger.shared.log("video-output-rebound", fields: [
-            "context": context,
-            "rebind_count": String(outputRebindCount),
-            "seconds": String(Int(playbackSeconds)),
-        ])
-        setPlaybackDebugState("video-output-rebound")
-        logPlaybackSnapshot(context: "video-output-rebound")
     }
 
     private func maybeRestartEndedItem(reason: String) {
@@ -1061,18 +1074,32 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
         ])
 
         player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            guard let self else { return }
-            self.lastDeliveredFrameHostTime = CACurrentMediaTime()
-            self.lastObservedItemTimeSeconds = -1
-            self.unchangedItemTimeTicks = 0
-            self.mediaDataChangeRequested = false
-            self.processingVideoOutput.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
-            self.player.play()
-            self.setPlaybackDebugState("loop-restarted")
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.lastDeliveredFrameHostTime = CACurrentMediaTime()
+                self.lastObservedItemTimeSeconds = -1
+                self.unchangedItemTimeTicks = 0
+                    self.lastProcessedPresentationTime = .invalid
+                    self.player.playImmediately(atRate: 1.0)
+                self.setPlaybackDebugState("loop-restarted")
+            }
         }
     }
 
-    private func emitDiagnosticsIfNeeded(hostTime: CFTimeInterval, itemTime: CMTime) {
+    private func isNearItemEnd(thresholdSeconds: Double = 1.0) -> Bool {
+        guard let item = player.currentItem else { return false }
+        let duration = CMTimeGetSeconds(item.duration)
+        guard duration.isFinite, duration > 0 else { return false }
+
+        let itemTime = CMTimeGetSeconds(item.currentTime())
+        if itemTime.isFinite, itemTime >= max(0, duration - thresholdSeconds) {
+            return true
+        }
+
+        return playbackSeconds >= max(0, duration - thresholdSeconds)
+    }
+
+    private func emitDiagnosticsIfNeeded(hostTime: CFTimeInterval, hasFrame: Bool) {
         let currentSecond = Int(playbackSeconds)
         if currentSecond < 0 || currentSecond == lastDetailedDiagnosticsSecond {
             return
@@ -1084,9 +1111,7 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
         }
         lastDetailedDiagnosticsSecond = currentSecond
 
-        let outputTime = processingVideoOutput.itemTime(forHostTime: hostTime)
-        let outputSeconds = CMTimeGetSeconds(outputTime)
-        let hasNewBuffer = processingVideoOutput.hasNewPixelBuffer(forItemTime: itemTime)
+        let presentationSeconds = lastProcessedPresentationTime.isValid ? CMTimeGetSeconds(lastProcessedPresentationTime) : -1.0
 
         let memory = currentProcessMemoryStatsMB()
         var fields: [String: String] = [
@@ -1094,15 +1119,11 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
             "window": isDeepWindow ? "deep" : "periodic",
             "time_control": String(player.timeControlStatus.rawValue),
             "rate": String(format: "%.2f", player.rate),
-            "item_s": String(format: "%.3f", CMTimeGetSeconds(itemTime)),
-            "output_s": String(format: "%.3f", outputSeconds.isFinite ? outputSeconds : -1),
-            "has_new_buffer": hasNewBuffer ? "true" : "false",
+            "presentation_s": String(format: "%.3f", presentationSeconds.isFinite ? presentationSeconds : -1),
+            "has_frame": hasFrame ? "true" : "false",
             "is_processing": isProcessingFrame ? "true" : "false",
             "pending_frame": pendingFrame == nil ? "false" : "true",
             "unchanged_ticks": String(unchangedItemTimeTicks),
-            "request_count": String(mediaDataChangeRequestCount),
-            "will_change_count": String(mediaDataWillChangeCount),
-            "rebind_count": String(outputRebindCount),
         ]
 
         if let rssMB = memory.rssMB {
@@ -1212,12 +1233,35 @@ struct StereoImmersivePlaybackView: View {
             PlaybackFaultLogger.shared.log("immersive-view-on-disappear")
             stereoPresentation.setStatus("Immersive view disappeared")
         }
+        .overlay(alignment: .topLeading) {
+            Button(action: {
+                stereoPresentation.requestStopPlayback()
+            }) {
+                Image(systemName: "chevron.backward.circle.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.96))
+                    .shadow(color: .black.opacity(0.5), radius: 10, x: 0, y: 2)
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 18)
+            .padding(.leading, 18)
+            .accessibilityLabel("Back")
+        }
     }
 }
 #endif
 
+private struct PanelFrameOriginPreferenceKey: PreferenceKey {
+    static let defaultValue: CGPoint = .zero
+
+    static func reduce(value: inout CGPoint, nextValue: () -> CGPoint) {
+        value = nextValue()
+    }
+}
+
 struct StereoVideoPlayerView: View {
     private static let immersiveSignposter = OSSignposter(subsystem: "com.vision.depth-player", category: "immersive")
+    private static let controlPanelSize = CGSize(width: 460, height: 180)
     @StateObject private var controller: StereoVideoPlayerController
     @Binding var isPlaying: Bool
     private let onUserStop: () -> Void
@@ -1225,8 +1269,14 @@ struct StereoVideoPlayerView: View {
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     private let rendererConfiguration: Video3DConfiguration
+    private let showRendererMetrics: Bool
     private let autoOpenImmersiveOnAppear: Bool
+    @State private var depthStrength: Double = 6.5
     @State private var rendererDiagnostics: String = "Renderer diagnostics pending..."
+    @State private var panelOffsetXDisplay: Double = 0.0
+    @State private var panelOffsetYDisplay: Double = 0.0
+    @State private var panelOffsetZDisplay: Double = -1.0
+    @State private var lastLoggedPanelOrigin: CGPoint?
     @State private var diagnosticsTask: Task<Void, Never>?
     @State private var didRequestImmersive = false
     @State private var isImmersiveOpen = false
@@ -1240,6 +1290,7 @@ struct StereoVideoPlayerView: View {
         hlsURL: URL,
         isPlaying: Binding<Bool>,
         rendererConfiguration: Video3DConfiguration,
+        showRendererMetrics: Bool = true,
         autoOpenImmersiveOnAppear: Bool = false,
         onUserStop: @escaping () -> Void = {}
     ) {
@@ -1262,6 +1313,7 @@ struct StereoVideoPlayerView: View {
         self._isPlaying = isPlaying
         self.onUserStop = onUserStop
         self.rendererConfiguration = rendererConfiguration
+        self.showRendererMetrics = showRendererMetrics
         self.autoOpenImmersiveOnAppear = autoOpenImmersiveOnAppear
     }
 
@@ -1290,80 +1342,92 @@ struct StereoVideoPlayerView: View {
     
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
-
-            if let loadingMessage = controller.loadingMessage {
-                ProgressView(loadingMessage)
-                    .tint(.blue)
-            } else {
-                Text(stereoPresentation.immersiveStatus)
-                    .foregroundColor(.gray)
-            }
+            Color.clear.ignoresSafeArea()
 
             VStack(spacing: 10) {
-                Text("Stereo playback is presented in immersive space")
-                    .font(.system(size: 15, weight: .semibold))
-                Text("This window is only the control surface. The headset should no longer show a side-by-side preview here.")
-                    .font(.system(size: 12))
-                    .foregroundColor(.gray)
-                    .multilineTextAlignment(.center)
 #if os(visionOS)
-                if !didRequestImmersive {
-                    Button("Enter Immersive Playback") {
-                        requestImmersiveOpen()
+                VStack(spacing: 6) {
+                    HStack {
+                        Text("Panel Window Coordinates")
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.9))
+                        Spacer()
+                        Text("Unavailable from visionOS API")
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundColor(.white.opacity(0.75))
                     }
-                    .buttonStyle(.borderedProminent)
-                }
-#endif
-#if os(visionOS)
-                Text(rendererDiagnostics)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundColor(.white)
-                    .multilineTextAlignment(.center)
-#endif
-            }
-            .padding(18)
-            .background(Color.black.opacity(0.55))
-            .cornerRadius(10)
-            
-            if let error = controller.lastError {
-                VStack(spacing: 12) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 32))
-                        .foregroundColor(.yellow)
-                    
-                    Text("Error")
-                        .font(.system(size: 14, weight: .semibold))
-                    
-                    Text(error)
-                        .font(.system(size: 12))
-                        .multilineTextAlignment(.center)
-                }
-                .padding(16)
-                .background(Color.black.opacity(0.8))
-                .cornerRadius(8)
-            }
-            
-            VStack {
-                HStack {
-                    Button(action: {
-#if os(visionOS)
-                        userInitiatedStop = true
-#endif
-                        onUserStop()
-                        isPlaying = false
-                    }) {
-                        Label("Back", systemImage: "chevron.left")
-                            .padding(8)
-                            .background(Color.black.opacity(0.6))
-                            .cornerRadius(6)
+
+                    HStack {
+                        Text("Immersive Panel Coordinates")
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.9))
+                        Spacer()
+                        Text(String(format: "X %.2f  Y %.2f  Z %.2f", panelOffsetXDisplay, panelOffsetYDisplay, panelOffsetZDisplay))
+                            .font(.system(size: 11, weight: .regular, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.75))
                     }
-                    Spacer()
+
+                    HStack {
+                        Text("3D Depth")
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                        Spacer()
+                        Text(String(format: "%.1f", depthStrength))
+                            .font(.system(size: 12, weight: .regular, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.75))
+                    }
+
+                    Slider(value: $depthStrength, in: 0...30, step: 0.5)
+                        .tint(.white.opacity(0.95))
+                        .onChange(of: depthStrength) { _, newValue in
+                            rendererConfiguration.disparityStrength = CGFloat(newValue)
+                            rendererConfiguration.rendererDebugStatus = "Depth strength \(String(format: "%.1f", newValue))"
+                        }
                 }
-                .padding(16)
-                
-                Spacer()
+                .frame(minWidth: 320, maxWidth: 420)
+
+                if showRendererMetrics {
+                    Text(rendererDiagnostics)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.85))
+                        .frame(minWidth: 320, maxWidth: 420, alignment: .leading)
+                        .lineLimit(1)
+                }
+#endif
             }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 8)
+            .background(Color.clear)
+
+        }
+        .frame(width: Self.controlPanelSize.width, height: Self.controlPanelSize.height, alignment: .topLeading)
+        .background(
+            GeometryReader { proxy in
+                Color.clear
+                    .preference(
+                        key: PanelFrameOriginPreferenceKey.self,
+                        value: proxy.frame(in: .global).origin
+                    )
+            }
+        )
+        .onPreferenceChange(PanelFrameOriginPreferenceKey.self) { origin in
+#if os(visionOS)
+            logPanelMovementProbe(origin)
+#endif
+        }
+        .overlay(alignment: .topLeading) {
+            Button(action: {
+                triggerUserStop()
+            }) {
+                Image(systemName: "chevron.backward.circle.fill")
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.96))
+                    .shadow(color: .black.opacity(0.45), radius: 8, x: 0, y: 2)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Back")
+            .padding(.top, 18)
+            .padding(.leading, 18)
         }
         .onAppear {
             PlaybackFaultLogger.shared.log("view-on-appear", fields: [
@@ -1371,9 +1435,14 @@ struct StereoVideoPlayerView: View {
             ])
             controller.attachStereoPresentation(stereoPresentation)
             controller.attachRendererConfiguration(rendererConfiguration)
+            depthStrength = Double(rendererConfiguration.disparityStrength)
+            panelOffsetXDisplay = Double(rendererConfiguration.panelOffsetX)
+            panelOffsetYDisplay = Double(rendererConfiguration.panelOffsetY)
+            panelOffsetZDisplay = Double(rendererConfiguration.panelOffsetZ)
+            lastLoggedPanelOrigin = nil
             isPlaying = true
             controller.start()
-            rendererDiagnostics = "\(rendererConfiguration.rendererDebugStatus) | sec=\(Int(controller.playbackSeconds)) vf=\(rendererConfiguration.receivedVideoFrameCount) rf=\(rendererConfiguration.renderedFrameCount) df=\(rendererConfiguration.depthFrameCount) | pb=\(controller.playbackDebugState)"
+            rendererDiagnostics = "sec=\(Int(controller.playbackSeconds)) vf=\(rendererConfiguration.receivedVideoFrameCount) rf=\(rendererConfiguration.renderedFrameCount) df=\(rendererConfiguration.depthFrameCount)"
 #if os(visionOS)
             rendererConfiguration.rendererDebugStatus = "Ready to open immersive on user action"
             userInitiatedStop = false
@@ -1381,7 +1450,10 @@ struct StereoVideoPlayerView: View {
             diagnosticsTask = Task {
                 while !Task.isCancelled {
                     await MainActor.run {
-                        rendererDiagnostics = "\(rendererConfiguration.rendererDebugStatus) | sec=\(Int(controller.playbackSeconds)) vf=\(rendererConfiguration.receivedVideoFrameCount) rf=\(rendererConfiguration.renderedFrameCount) df=\(rendererConfiguration.depthFrameCount) | pb=\(controller.playbackDebugState)"
+                        rendererDiagnostics = "sec=\(Int(controller.playbackSeconds)) vf=\(rendererConfiguration.receivedVideoFrameCount) rf=\(rendererConfiguration.renderedFrameCount) df=\(rendererConfiguration.depthFrameCount)"
+                        panelOffsetXDisplay = Double(rendererConfiguration.panelOffsetX)
+                        panelOffsetYDisplay = Double(rendererConfiguration.panelOffsetY)
+                        panelOffsetZDisplay = Double(rendererConfiguration.panelOffsetZ)
                     }
                     try? await Task.sleep(nanoseconds: 400_000_000)
                 }
@@ -1431,9 +1503,76 @@ struct StereoVideoPlayerView: View {
         .onChange(of: scenePhase) { _, newPhase in
             PlaybackFaultLogger.shared.log("scene-phase", fields: ["phase": String(describing: newPhase)])
         }
+        .onChange(of: stereoPresentation.stopRequestID) { _, _ in
+            triggerUserStop()
+        }
+#if os(visionOS)
+        .glassBackgroundEffect(displayMode: .never)
+#endif
+    }
+
+    private func triggerUserStop() {
+#if os(visionOS)
+        guard isPlaying else { return }
+        userInitiatedStop = true
+        Task {
+            if isImmersiveOpen {
+                await dismissImmersiveSpace()
+                await MainActor.run {
+                    isImmersiveOpen = false
+                    rendererConfiguration.rendererDebugStatus = "Immersive space dismissed"
+                    stereoPresentation.setStatus("Immersive playback closed")
+                }
+            }
+            await MainActor.run {
+                onUserStop()
+                isPlaying = false
+            }
+        }
+#else
+        onUserStop()
+        isPlaying = false
+#endif
     }
 
 #if os(visionOS)
+    private func logPanelMovementProbe(_ origin: CGPoint) {
+        let roundedOrigin = CGPoint(x: round(origin.x * 10) / 10, y: round(origin.y * 10) / 10)
+
+        guard let previousOrigin = lastLoggedPanelOrigin else {
+            lastLoggedPanelOrigin = roundedOrigin
+            PlaybackFaultLogger.shared.log("panel-content-origin-initial", fields: [
+                "x": String(format: "%.1f", roundedOrigin.x),
+                "y": String(format: "%.1f", roundedOrigin.y),
+            ])
+            rendererConfiguration.rendererDebugStatus = String(
+                format: "Panel probe origin x=%.1f y=%.1f",
+                roundedOrigin.x,
+                roundedOrigin.y
+            )
+            return
+        }
+
+        let deltaX = roundedOrigin.x - previousOrigin.x
+        let deltaY = roundedOrigin.y - previousOrigin.y
+        guard abs(deltaX) >= 0.5 || abs(deltaY) >= 0.5 else { return }
+
+        lastLoggedPanelOrigin = roundedOrigin
+        PlaybackFaultLogger.shared.log("panel-content-origin-changed", fields: [
+            "x": String(format: "%.1f", roundedOrigin.x),
+            "y": String(format: "%.1f", roundedOrigin.y),
+            "dx": String(format: "%.1f", deltaX),
+            "dy": String(format: "%.1f", deltaY),
+        ])
+        rendererConfiguration.rendererDebugStatus = String(
+            format: "Panel probe moved x=%.1f y=%.1f dx=%.1f dy=%.1f",
+            roundedOrigin.x,
+            roundedOrigin.y,
+            deltaX,
+            deltaY
+        )
+    }
+
     private func requestImmersiveOpen() {
         guard !didRequestImmersive else { return }
 
