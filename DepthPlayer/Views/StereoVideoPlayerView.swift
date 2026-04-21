@@ -435,8 +435,9 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
         ]
         self.processingVideoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: attrs)
         self.processingVideoOutput.suppressesPlayerRendering = false
-        self.rendererVideoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: attrs)
-        self.rendererVideoOutput.suppressesPlayerRendering = false
+        // Share a single output object between Swift processing and compositor renderer
+        // to avoid duplicate output queues and decoder-side buffering growth.
+        self.rendererVideoOutput = self.processingVideoOutput
         
         super.init()
 
@@ -473,7 +474,9 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
         }
         if let observedItem {
             observedItem.remove(processingVideoOutput)
-            observedItem.remove(rendererVideoOutput)
+            if rendererVideoOutput !== processingVideoOutput {
+                observedItem.remove(rendererVideoOutput)
+            }
         }
         NotificationCenter.default.removeObserver(self)
     }
@@ -671,7 +674,9 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
 
         if let observedItem {
             observedItem.remove(processingVideoOutput)
-            observedItem.remove(rendererVideoOutput)
+            if rendererVideoOutput !== processingVideoOutput {
+                observedItem.remove(rendererVideoOutput)
+            }
         }
 
         itemStatusObservation?.invalidate()
@@ -700,8 +705,15 @@ final class StereoVideoPlayerController: NSObject, ObservableObject, AVPlayerIte
 
         setPlaybackDebugState("bound-new-item")
 
+        // Keep AVFoundation buffering bounded so it doesn't consume the same jetsam budget
+        // as the compositor and depth pipeline.
+        item.preferredForwardBufferDuration = 1.0
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
+
         item.add(processingVideoOutput)
-        item.add(rendererVideoOutput)
+        if rendererVideoOutput !== processingVideoOutput {
+            item.add(rendererVideoOutput)
+        }
         mediaDataChangeRequested = false
         lastMediaDataChangeRequestHostTime = 0
         mediaDataChangeRequestCount = 0
