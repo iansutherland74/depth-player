@@ -1,6 +1,5 @@
 import SwiftUI
 #if os(visionOS)
-import CompositorServices
 #endif
 
 @main
@@ -33,10 +32,11 @@ struct DepthPlayerApp: App {
 
 #if os(visionOS)
         ImmersiveSpace(id: "DepthPlayerStereoImmersive") {
-            CompositorLayer { layerRenderer in
-                rendererConfiguration.rendererDebugStatus = "Compositor layer attached"
-                StartVideo3DRenderer(layerRenderer, rendererConfiguration)
-            }
+            StereoImmersivePlaybackView()
+                .environmentObject(stereoPresentation)
+                .onAppear {
+                    rendererConfiguration.rendererDebugStatus = "RealityKit immersive view attached"
+                }
         }
 #endif
     }

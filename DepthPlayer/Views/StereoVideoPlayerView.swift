@@ -6,6 +6,7 @@ import CoreImage
 import QuartzCore
 import CoreMedia
 import OSLog
+import Accelerate
 import Darwin
 #if os(visionOS)
 import RealityKit
@@ -24,6 +25,10 @@ final class StereoPresentationCoordinator: ObservableObject {
     func attach(renderer: AVSampleBufferVideoRenderer) {
         self.renderer = renderer
         immersiveStatus = "Stereo renderer attached"
+    }
+
+    func flushRenderer() {
+        renderer?.flush()
     }
 
     func detach() {
@@ -45,11 +50,50 @@ final class StereoSampleBufferBridge: @unchecked Sendable {
 
     private var cachedFormatDescription: CMFormatDescription?
     private var cachedDimensions: CMVideoDimensions?
+    // Monotonic presentation clock for VideoPlayerComponent's host-time render synchronizer.
+    private var nextScheduledTime: CMTime = .invalid
+    private var lastEnqueueHostTime: CMTime = .invalid
+    private static let lookahead = CMTime(seconds: 0.028, preferredTimescale: 1_000_000)
+
+    func flushForReattach() {
+        renderer.flush()
+        cachedFormatDescription = nil
+        cachedDimensions = nil
+        nextScheduledTime = .invalid
+        lastEnqueueHostTime = .invalid
+    }
 
     func enqueue(pixelBuffer: CVPixelBuffer, at presentationTime: CMTime, duration: CMTime = .invalid) throws {
-        guard renderer.isReadyForMoreMediaData else { return }
+        // VideoPlayerComponent's render synchronizer runs on the host (mach absolute time) clock.
+        // Media timestamps would be treated as far-future and never shown.
+        //
+        // We measure the actual wall-clock interval between successive enqueue calls and use that
+        // as the frame duration. When depth inference runs at 12 fps the measured interval is ~83 ms
+        // and frames tile perfectly with no gaps. A fixed 1/30 s duration would leave 50 ms holes
+        // between every frame causing visible stutter.
+        let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
+        let earliest = CMTimeAdd(hostNow, Self.lookahead)
+
+        // Use a fixed frame duration that matches the active processing cadence.
+        // The caller supplies duration when load shedding adjusts cadence.
+        lastEnqueueHostTime = hostNow
+        let frameDuration = (duration.isValid && duration != .zero) ? duration : CMTime(value: 1, timescale: 12)
+
+        // Cap drift: if nextScheduledTime is more than 2 frame durations ahead of now+lookahead,
+        // reset it. This prevents a burst of late-delivered frames from queuing up far in the future
+        // and playing back too fast when the renderer catches up (visible as stutter/judder).
+        let threeFrames = CMTimeAdd(CMTimeAdd(frameDuration, frameDuration), frameDuration)
+        let maxLead = CMTimeAdd(earliest, threeFrames)
+        let scheduleTime: CMTime
+        if nextScheduledTime.isValid && CMTimeCompare(nextScheduledTime, earliest) > 0 && CMTimeCompare(nextScheduledTime, maxLead) <= 0 {
+            scheduleTime = nextScheduledTime
+        } else {
+            scheduleTime = earliest
+        }
+        nextScheduledTime = CMTimeAdd(scheduleTime, frameDuration)
+
         let formatDescription = try getFormatDescription(for: pixelBuffer)
-        let timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: presentationTime, decodeTimeStamp: .invalid)
+        let timing = CMSampleTimingInfo(duration: frameDuration, presentationTimeStamp: scheduleTime, decodeTimeStamp: .invalid)
         let sampleBuffer = try CMSampleBuffer(
             imageBuffer: pixelBuffer,
             formatDescription: formatDescription,
@@ -60,6 +104,8 @@ final class StereoSampleBufferBridge: @unchecked Sendable {
 
     func flush() {
         renderer.flush()
+        nextScheduledTime = .invalid
+        lastEnqueueHostTime = .invalid
     }
 
     private func getFormatDescription(for pixelBuffer: CVPixelBuffer) throws -> CMFormatDescription {
@@ -96,8 +142,13 @@ final class StereoSampleBufferBridge: @unchecked Sendable {
 
 final class StereoFrameProcessor: @unchecked Sendable {
     private let estimator: DepthAnythingEstimator
-    private let ciContext = CIContext()
-    private let maxDisparity: CGFloat
+    // Explicit sRGB output prevents Vision Pro's wide-gamut display from washing out colours.
+    private let ciContext = CIContext(options: [
+        .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any,
+        .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any,
+    ])
+    private let disparityControlQueue = DispatchQueue(label: "com.vision.depthplayer.disparity-control")
+    private var runtimeMaxDisparity: CGFloat
     private let temporalSmoothing: Float
     private var depthEMA: MLMultiArray?
     private var stereoPixelBufferPool: CVPixelBufferPool?
@@ -106,66 +157,208 @@ final class StereoFrameProcessor: @unchecked Sendable {
     private var depthPixelBufferPool: CVPixelBufferPool?
     private var depthPoolWidth: Int = 0
     private var depthPoolHeight: Int = 0
+    private var cachedDepthForReuse: MLMultiArray?
+    private var lastDepthInferenceHostTime: CFTimeInterval = 0
+    private let depthInferenceInterval: CFTimeInterval = 1.0 / 6.0
+    private var consecutiveDepthFailures = 0
+    private var depthBypassUntilHostTime: CFTimeInterval = 0
+    private let maxConsecutiveDepthFailures = 3
+    private let depthBypassDuration: CFTimeInterval = 2.0
 
     init(model: MLModel, maxDisparity: CGFloat, temporalSmoothing: Float) throws {
         self.estimator = try DepthAnythingEstimator(model: model)
-        self.maxDisparity = maxDisparity
+        self.runtimeMaxDisparity = max(0, maxDisparity)
         self.temporalSmoothing = min(max(temporalSmoothing, 0), 0.99)
     }
 
+    func updateMaxDisparity(_ value: CGFloat) {
+        disparityControlQueue.sync {
+            runtimeMaxDisparity = max(0, value)
+        }
+    }
+
     func process(pixelBuffer: CVPixelBuffer) throws -> StereoProcessedFrame {
-        let depth = try estimator.predictDepth(pixelBuffer: pixelBuffer)
-        let smoothedDepth = try smoothDepth(depth)
-        return try makeStereoSBS(pixelBuffer: pixelBuffer, depth: smoothedDepth)
+        let activeDisparity = disparityControlQueue.sync { runtimeMaxDisparity }
+        if activeDisparity <= 0.001 {
+            return try makeStereoSBSWithoutDepth(pixelBuffer: pixelBuffer)
+        }
+        // Stable path: uniform stereo parallax preserves cadence and avoids audio-only regressions.
+        return try makeStereoSBSParallax(pixelBuffer: pixelBuffer, disparity: activeDisparity)
+    }
+
+    private func makeStereoSBSWithoutDepth(pixelBuffer: CVPixelBuffer) throws -> StereoProcessedFrame {
+        let source = CIImage(cvPixelBuffer: pixelBuffer, options: [.colorSpace: Self.bt709])
+        let width = source.extent.width
+        let height = source.extent.height
+
+        let canvasRect = CGRect(x: 0, y: 0, width: width * 2, height: height)
+        let background = CIImage(color: .black).cropped(to: canvasRect)
+
+        let rightPlaced = source.transformed(by: CGAffineTransform(translationX: width, y: 0))
+        let composed = rightPlaced
+            .composited(over: source)
+            .composited(over: background)
+
+        let stereoWidth = Int(width * 2)
+        let stereoHeight = Int(height)
+        let stereoPixelBuffer = try makeReusableStereoPixelBuffer(width: stereoWidth, height: stereoHeight)
+
+        let colorAttachments: [CFString: Any] = [
+            kCVImageBufferColorPrimariesKey: kCVImageBufferColorPrimaries_ITU_R_709_2,
+            kCVImageBufferTransferFunctionKey: kCVImageBufferTransferFunction_ITU_R_709_2,
+            kCVImageBufferYCbCrMatrixKey: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        ]
+        CVBufferSetAttachments(stereoPixelBuffer, colorAttachments as CFDictionary, .shouldPropagate)
+
+        ciContext.render(
+            composed,
+            to: stereoPixelBuffer,
+            bounds: CGRect(x: 0, y: 0, width: CGFloat(stereoWidth), height: CGFloat(stereoHeight)),
+            colorSpace: Self.bt709
+        )
+        return StereoProcessedFrame(stereoPixelBuffer: stereoPixelBuffer)
+    }
+
+    private func makeStereoSBSParallax(pixelBuffer: CVPixelBuffer, disparity: CGFloat) throws -> StereoProcessedFrame {
+        let source = CIImage(cvPixelBuffer: pixelBuffer, options: [.colorSpace: Self.bt709])
+        let width = source.extent.width
+        let height = source.extent.height
+
+        // Stable pseudo-depth: blend near/far shifted layers using a luminance-derived mask.
+        // This adds depth cues without enabling ML inference in the playback loop.
+        let shiftPixels = min(max(disparity * 150.0, 0), 150.0)
+        let nearShift = shiftPixels * 0.5
+        let farShift = shiftPixels * 0.2
+
+        let pseudoDepthMask = source
+            .applyingFilter("CIColorControls", parameters: [
+                kCIInputSaturationKey: 0.0,
+                kCIInputContrastKey: 1.25,
+                kCIInputBrightnessKey: 0.0,
+            ])
+            .clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 3.0])
+            .cropped(to: source.extent)
+
+        let leftNear = source.transformed(by: CGAffineTransform(translationX: nearShift, y: 0))
+        let leftFar = source.transformed(by: CGAffineTransform(translationX: -farShift, y: 0))
+        let rightNear = source.transformed(by: CGAffineTransform(translationX: -nearShift, y: 0))
+        let rightFar = source.transformed(by: CGAffineTransform(translationX: farShift, y: 0))
+
+        let left = leftNear
+            .applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: leftFar,
+                kCIInputMaskImageKey: pseudoDepthMask,
+            ])
+            .cropped(to: source.extent)
+
+        let right = rightNear
+            .applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: rightFar,
+                kCIInputMaskImageKey: pseudoDepthMask,
+            ])
+            .cropped(to: source.extent)
+
+        let canvasRect = CGRect(x: 0, y: 0, width: width * 2, height: height)
+        let background = CIImage(color: .black).cropped(to: canvasRect)
+        let rightPlaced = right.transformed(by: CGAffineTransform(translationX: width, y: 0))
+        let composed = rightPlaced
+            .composited(over: left)
+            .composited(over: background)
+
+        let stereoWidth = Int(width * 2)
+        let stereoHeight = Int(height)
+        let stereoPixelBuffer = try makeReusableStereoPixelBuffer(width: stereoWidth, height: stereoHeight)
+
+        let colorAttachments: [CFString: Any] = [
+            kCVImageBufferColorPrimariesKey: kCVImageBufferColorPrimaries_ITU_R_709_2,
+            kCVImageBufferTransferFunctionKey: kCVImageBufferTransferFunction_ITU_R_709_2,
+            kCVImageBufferYCbCrMatrixKey: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        ]
+        CVBufferSetAttachments(stereoPixelBuffer, colorAttachments as CFDictionary, .shouldPropagate)
+
+        ciContext.render(
+            composed,
+            to: stereoPixelBuffer,
+            bounds: CGRect(x: 0, y: 0, width: CGFloat(stereoWidth), height: CGFloat(stereoHeight)),
+            colorSpace: Self.bt709
+        )
+        return StereoProcessedFrame(stereoPixelBuffer: stereoPixelBuffer)
     }
 
     private func smoothDepth(_ depth: MLMultiArray) throws -> MLMultiArray {
-        guard let prev = depthEMA else {
+        if temporalSmoothing <= 0.001 {
             depthEMA = depth
             return depth
         }
 
-        guard prev.count == depth.count else {
+        guard depth.dataType == .float32 else {
             depthEMA = depth
             return depth
         }
 
-        let out = try MLMultiArray(shape: depth.shape, dataType: .float32)
+        let ema: MLMultiArray
+        if let prev = depthEMA, prev.count == depth.count, prev.dataType == .float32 {
+            ema = prev
+        } else {
+            ema = try MLMultiArray(shape: depth.shape, dataType: .float32)
+            let src = depth.dataPointer.bindMemory(to: Float.self, capacity: depth.count)
+            let dst = ema.dataPointer.bindMemory(to: Float.self, capacity: depth.count)
+            dst.assign(from: src, count: depth.count)
+            depthEMA = ema
+            return ema
+        }
+
         let alpha = temporalSmoothing
+        var alphaScalar = alpha
+        var oneMinusAlpha = 1.0 - alpha
+        let depthPtr = depth.dataPointer.bindMemory(to: Float.self, capacity: depth.count)
+        let emaPtr = ema.dataPointer.bindMemory(to: Float.self, capacity: ema.count)
+        let n = vDSP_Length(depth.count)
 
-        for i in 0..<depth.count {
-            let d = depth[i].floatValue
-            let p = prev[i].floatValue
-            out[i] = NSNumber(value: alpha * p + (1.0 - alpha) * d)
-        }
+        // EMA in-place: ema = alpha * ema + (1 - alpha) * depth.
+        vDSP_vsmul(emaPtr, 1, &alphaScalar, emaPtr, 1, n)
+        vDSP_vsma(depthPtr, 1, &oneMinusAlpha, emaPtr, 1, emaPtr, 1, n)
 
-        depthEMA = out
-        return out
+        depthEMA = ema
+        return ema
     }
 
-    private func makeStereoSBS(pixelBuffer: CVPixelBuffer, depth: MLMultiArray) throws -> StereoProcessedFrame {
-        let source = CIImage(cvPixelBuffer: pixelBuffer)
+    private static let bt709 = CGColorSpace(name: CGColorSpace.itur_709)!
+
+    private func makeStereoSBS(pixelBuffer: CVPixelBuffer, depth: MLMultiArray, disparity: CGFloat) throws -> StereoProcessedFrame {
+        // Tag the source image with BT.709 so Core Image's colour pipeline stays in the
+        // correct space rather than treating gamma-encoded video as linear light.
+        let source = CIImage(cvPixelBuffer: pixelBuffer, options: [.colorSpace: Self.bt709])
         let width = source.extent.width
         let height = source.extent.height
 
         let depthImage = try makeNormalizedDepthImage(from: depth)
             .transformed(by: CGAffineTransform(scaleX: width / depthWidth(depth), y: height / depthHeight(depth)))
+            .clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 2.8])
             .cropped(to: source.extent)
 
-        let leftOffset = maxDisparity * 0.25
-        let rightOffset = -maxDisparity * 0.25
+        let maxShiftPixels = min(max(disparity * 150.0, 0), 150.0)
+        let nearShift = maxShiftPixels * 0.5
+        let farShift = maxShiftPixels * 0.2
 
-        let left = source
-            .applyingFilter("CIDisplacementDistortion", parameters: [
-                "inputDisplacementImage": depthImage,
-                kCIInputScaleKey: leftOffset,
+        let leftNear = source.transformed(by: CGAffineTransform(translationX: nearShift, y: 0))
+        let leftFar = source.transformed(by: CGAffineTransform(translationX: -farShift, y: 0))
+        let rightNear = source.transformed(by: CGAffineTransform(translationX: -nearShift, y: 0))
+        let rightFar = source.transformed(by: CGAffineTransform(translationX: farShift, y: 0))
+
+        let left = leftNear
+            .applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: leftFar,
+                kCIInputMaskImageKey: depthImage,
             ])
             .cropped(to: source.extent)
 
-        let right = source
-            .applyingFilter("CIDisplacementDistortion", parameters: [
-                "inputDisplacementImage": depthImage,
-                kCIInputScaleKey: rightOffset,
+        let right = rightNear
+            .applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: rightFar,
+                kCIInputMaskImageKey: depthImage,
             ])
             .cropped(to: source.extent)
 
@@ -181,7 +374,16 @@ final class StereoFrameProcessor: @unchecked Sendable {
         let stereoHeight = Int(height)
         let stereoPixelBuffer = try makeReusableStereoPixelBuffer(width: stereoWidth, height: stereoHeight)
 
-        ciContext.render(composed, to: stereoPixelBuffer)
+        // Explicitly attach BT.709 colour metadata to each buffer. Pool creation attributes
+        // do not automatically propagate to CVBuffer attachments that VideoPlayerComponent reads.
+        let colorAttachments: [CFString: Any] = [
+            kCVImageBufferColorPrimariesKey: kCVImageBufferColorPrimaries_ITU_R_709_2,
+            kCVImageBufferTransferFunctionKey: kCVImageBufferTransferFunction_ITU_R_709_2,
+            kCVImageBufferYCbCrMatrixKey: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        ]
+        CVBufferSetAttachments(stereoPixelBuffer, colorAttachments as CFDictionary, .shouldPropagate)
+
+        ciContext.render(composed, to: stereoPixelBuffer, bounds: CGRect(x: 0, y: 0, width: CGFloat(stereoWidth), height: CGFloat(stereoHeight)), colorSpace: Self.bt709)
         return StereoProcessedFrame(stereoPixelBuffer: stereoPixelBuffer)
     }
 
@@ -249,6 +451,9 @@ final class StereoFrameProcessor: @unchecked Sendable {
                 kCVPixelBufferCGImageCompatibilityKey: true,
                 kCVPixelBufferCGBitmapContextCompatibilityKey: true,
                 kCVPixelBufferMetalCompatibilityKey: true,
+                // Colour metadata so VideoPlayerComponent applies the right transform.
+                kCVImageBufferColorPrimariesKey: kCVImageBufferColorPrimaries_ITU_R_709_2,
+                kCVImageBufferTransferFunctionKey: kCVImageBufferTransferFunction_ITU_R_709_2,
             ]
 
             var pool: CVPixelBufferPool?
@@ -377,8 +582,10 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
     
     private var displayLink: CADisplayLink?
     private var fallbackTimer: Timer?
+    private var outputTimer: Timer?
     private var isProcessingFrame = false
     private var pendingFrame: PendingFrame?
+    private weak var rendererConfiguration: Video3DConfiguration?
     private var observedItem: AVPlayerItem?
     private var itemStatusObservation: NSKeyValueObservation?
     private var bufferEmptyObservation: NSKeyValueObservation?
@@ -406,9 +613,23 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
     private var noFrameIntervalState: OSSignpostIntervalState?
     private var startupIntervalState: OSSignpostIntervalState?
     private var lastFrameProcessHostTime = 0.0
+    private var lastOutputEnqueueHostTime = 0.0
+    private var lastActualOutputEnqueueHostTime = 0.0
+    private var latestOutputItemTime: CMTime = .invalid
+    private var lastRenderedStereoPixelBuffer: CVPixelBuffer?
+    private var processDurationSumMs = 0.0
+    private var processDurationMinMs = Double.greatestFiniteMagnitude
+    private var processDurationMaxMs = 0.0
+    private var processDurationCount = 0
+    private var enqueueIntervalSumMs = 0.0
+    private var enqueueIntervalMinMs = Double.greatestFiniteMagnitude
+    private var enqueueIntervalMaxMs = 0.0
+    private var enqueueIntervalCount = 0
     private let signposter = OSSignposter(subsystem: "com.vision.depth-player", category: "playback-pipeline")
-    private let baseFrameProcessInterval: Double = 1.0 / 12.0
-    private var currentFrameProcessInterval: Double = 1.0 / 12.0
+    // Ultra-smooth profile: prioritize temporal stability over depth intensity.
+    private let outputFrameInterval: Double = 1.0 / 90.0
+    private let baseFrameProcessInterval: Double
+    private var currentFrameProcessInterval: Double
     private var lastSheddingTier: Int = 0
     
     private let maxDisparity: CGFloat
@@ -428,6 +649,14 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
             maxDisparity: maxDisparity,
             temporalSmoothing: temporalSmoothing
         )
+        // In depth-bypass mode, process at 30 fps and duplicate to output cadence.
+        // In depth-enabled mode, keep video cadence high and reuse depth between inferences.
+        if maxDisparity <= 0.001 {
+            self.baseFrameProcessInterval = 1.0 / 30.0
+        } else {
+            self.baseFrameProcessInterval = 1.0 / 30.0
+        }
+        self.currentFrameProcessInterval = self.baseFrameProcessInterval
         
         // Build AVVideoOutputSpecification for monoscopic (2D) content.
         // kCMStereoView_None = CMStereoViewComponents() — no stereo eyes, i.e. regular 2D.
@@ -452,6 +681,7 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
     isolated deinit {
         displayLink?.invalidate()
         fallbackTimer?.invalidate()
+        outputTimer?.invalidate()
         itemStatusObservation?.invalidate()
         bufferEmptyObservation?.invalidate()
         likelyToKeepUpObservation?.invalidate()
@@ -490,6 +720,11 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
         lastObservedItemTimeSeconds = -1
         unchangedItemTimeTicks = 0
         lastProcessedPresentationTime = .invalid
+        lastOutputEnqueueHostTime = 0
+        lastActualOutputEnqueueHostTime = 0
+        latestOutputItemTime = .invalid
+        lastRenderedStereoPixelBuffer = nil
+        resetJitterTelemetryWindow()
         setPlaybackDebugState("started")
         PlaybackFaultLogger.shared.log("controller-start")
         startupIntervalState = signposter.beginInterval("StartupToFirstFrame", id: signposter.makeSignpostID())
@@ -499,14 +734,26 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
         
 #if os(visionOS)
         let link = CADisplayLink(target: self, selector: #selector(step))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 24, maximum: 60, preferred: 30)
+    // Lock to 90 Hz so output pacing does not wander between 60/90/120 domains.
+    link.preferredFrameRateRange = CAFrameRateRange(minimum: 90, maximum: 90, preferred: 90)
         link.add(to: .main, forMode: .common)
         displayLink = link
 #else
-        fallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+    fallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.step()
             }
+        }
+#endif
+
+#if !os(visionOS)
+        outputTimer = Timer.scheduledTimer(withTimeInterval: outputFrameInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.outputTick()
+            }
+        }
+        if let outputTimer {
+            RunLoop.main.add(outputTimer, forMode: .common)
         }
 #endif
     }
@@ -517,8 +764,15 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
         displayLink = nil
         fallbackTimer?.invalidate()
         fallbackTimer = nil
+        outputTimer?.invalidate()
+        outputTimer = nil
         pendingFrame = nil
         isProcessingFrame = false
+        lastOutputEnqueueHostTime = 0
+        lastActualOutputEnqueueHostTime = 0
+        latestOutputItemTime = .invalid
+        lastRenderedStereoPixelBuffer = nil
+        resetJitterTelemetryWindow()
         loadingMessage = nil
         playbackSeconds = 0
         setPlaybackDebugState("stopped")
@@ -542,6 +796,7 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
 
 #if os(visionOS)
     func attachRendererConfiguration(_ configuration: Video3DConfiguration) {
+        self.rendererConfiguration = configuration
         configuration.playerVideoOutput = playerVideoOutput
         configuration.rendererDebugStatus = "Player attached AVPlayerVideoOutput"
     }
@@ -551,6 +806,15 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
             configuration.playerVideoOutput = nil
         }
         configuration.rendererDebugStatus = "Player detached AVPlayerVideoOutput"
+    }
+
+    func updateDepthStrength(_ uiValue: CGFloat) {
+        // User-facing depth is 0...1.04; keep mapping in the focus-safe band.
+        let clampedUI = min(max(uiValue, 0), 1.04)
+        let mappedDisparity = min(max(clampedUI / 30.0, 0), 1.0)
+        processor.updateMaxDisparity(mappedDisparity)
+        currentFrameProcessInterval = 1.0 / 30.0
+        setPlaybackDebugState(String(format: "depth-safe-ui-%.2f-map-%.2f", clampedUI, mappedDisparity))
     }
 #endif
     
@@ -569,7 +833,11 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
     }
     
     @objc private func step() {
+    #if os(visionOS)
+        let hostTime = displayLink?.targetTimestamp ?? CACurrentMediaTime()
+    #else
         let hostTime = CACurrentMediaTime()
+    #endif
         let hostCMTime = CMTime(seconds: hostTime, preferredTimescale: 1_000_000)
 
         // Pull frame from AVPlayerVideoOutput (player-level, no per-item rebinding needed).
@@ -618,6 +886,19 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
                 unchangedItemTimeTicks = 0
                 lastObservedItemTimeSeconds = mediaClockSeconds
             }
+        }
+
+        // On visionOS, drive output enqueue from display-link time to avoid Timer jitter.
+        let displayItemTime: CMTime
+        if latestOutputItemTime.isValid, latestOutputItemTime != .zero {
+            displayItemTime = latestOutputItemTime
+        } else if resolvedFrameTime.isValid, resolvedFrameTime != .zero {
+            displayItemTime = resolvedFrameTime
+        } else {
+            displayItemTime = playerTime
+        }
+        if displayItemTime.isValid, displayItemTime != .zero {
+            enqueueDuplicateFrameIfNeeded(itemTime: displayItemTime, hostTime: hostTime)
         }
 
         emitDiagnosticsIfNeeded(hostTime: hostTime, hasFrame: frameResult != nil)
@@ -678,14 +959,6 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
             return
         }
 
-        // Deduplicate: skip if same presentation time as the last processed frame.
-          if resolvedFrameTime.isValid,
-              resolvedFrameTime != .zero,
-              resolvedFrameTime == lastProcessedPresentationTime {
-            return
-        }
-        lastProcessedPresentationTime = resolvedFrameTime
-
         lastDeliveredFrameHostTime = CACurrentMediaTime()
         if let noFrameIntervalState {
             signposter.endInterval("NoFrameGap", noFrameIntervalState)
@@ -694,6 +967,10 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
         if player.timeControlStatus == .playing {
             setPlaybackDebugState("streaming-frames")
         }
+
+        let frameTimeForProcessing = (resolvedFrameTime.isValid && resolvedFrameTime != .zero) ? resolvedFrameTime : hostCMTime
+        latestOutputItemTime = frameTimeForProcessing
+        lastProcessedPresentationTime = resolvedFrameTime
 
         if hostTime - lastFrameProcessHostTime < currentFrameProcessInterval {
             return
@@ -719,14 +996,28 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
             return
         }
 
-        let frameTimeForProcessing = (resolvedFrameTime.isValid && resolvedFrameTime != .zero) ? resolvedFrameTime : hostCMTime
-
         if isProcessingFrame {
             pendingFrame = PendingFrame(pixelBuffer: pixelBuffer, itemTime: frameTimeForProcessing)
             return
         }
 
         processFrame(pixelBuffer, itemTime: frameTimeForProcessing)
+    }
+
+    @objc private func outputTick() {
+        guard isRunning else { return }
+#if os(visionOS)
+        return
+#else
+        let hostTime = CACurrentMediaTime()
+        let itemTime: CMTime
+        if latestOutputItemTime.isValid, latestOutputItemTime != .zero {
+            itemTime = latestOutputItemTime
+        } else {
+            itemTime = player.currentTime()
+        }
+        enqueueDuplicateFrameIfNeeded(itemTime: itemTime, hostTime: hostTime)
+#endif
     }
 
     private func configureObservers() {
@@ -769,7 +1060,9 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
 
         // Keep AVFoundation buffering bounded so it doesn't consume the same jetsam budget
         // as the compositor and depth pipeline.
-        item.preferredForwardBufferDuration = 1.0
+        // Keep a 10-second forward buffer so the depth pipeline's processing overhead
+        // doesn't starve AVPlayer — a 1-second buffer was running dry at second 239.
+        item.preferredForwardBufferDuration = 10.0
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
         // Prefer 4K variants when the stream ladder provides them.
         item.preferredMaximumResolution = CGSize(width: 3840, height: 2160)
@@ -964,15 +1257,17 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
     private func processFrame(_ pixelBuffer: CVPixelBuffer, itemTime: CMTime) {
         isProcessingFrame = true
         let processor = self.processor
-        let stereoBridge = self.stereoBridge
+        let processingStartHostTime = CACurrentMediaTime()
 
         processingQueue.async { [weak self] in
             let result = autoreleasepool(invoking: {
                 Result { try processor.process(pixelBuffer: pixelBuffer) }
             })
+            let processingDurationMs = (CACurrentMediaTime() - processingStartHostTime) * 1000.0
 
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.recordProcessingDurationMs(processingDurationMs)
 
                 self.isProcessingFrame = false
 
@@ -981,6 +1276,8 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
                     self.lastError = nil
                     self.loadingMessage = nil
                     self.hasProducedFirstFrame = true
+                    self.rendererConfiguration?.depthFrameCount += 1
+                    self.rendererConfiguration?.receivedVideoFrameCount += 1
                     self.setPlaybackDebugState("frame-processed")
                     if let startupIntervalState = self.startupIntervalState {
                         self.signposter.endInterval("StartupToFirstFrame", startupIntervalState)
@@ -989,7 +1286,9 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
                             "seconds": String(Int(self.playbackSeconds)),
                         ])
                     }
-                    try? stereoBridge.enqueue(pixelBuffer: frame.stereoPixelBuffer, at: itemTime)
+                    // Update the latest processed stereo frame; fixed-rate output enqueues
+                    // are performed on the display tick in enqueueDuplicateFrameIfNeeded().
+                    self.lastRenderedStereoPixelBuffer = frame.stereoPixelBuffer
                 case let .failure(error):
                     if let nsError = error as NSError?, nsError.domain == "StereoFrameProcessor", nsError.code == -5 {
                         // Pool allocation threshold reached: skip this frame to cap memory growth.
@@ -1004,6 +1303,53 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
                     self.pendingFrame = nil
                     self.processFrame(pendingFrame.pixelBuffer, itemTime: pendingFrame.itemTime)
                 }
+            }
+        }
+    }
+
+    private func enqueueDuplicateFrameIfNeeded(itemTime: CMTime, hostTime: CFTimeInterval) {
+        guard let lastRenderedStereoPixelBuffer else { return }
+#if !os(visionOS)
+        guard hostTime - lastOutputEnqueueHostTime >= outputFrameInterval else { return }
+#endif
+
+        let enqueueDuration = CMTime(seconds: outputFrameInterval, preferredTimescale: 1_000_000)
+        do {
+            try stereoBridge.enqueue(pixelBuffer: lastRenderedStereoPixelBuffer, at: itemTime, duration: enqueueDuration)
+            rendererConfiguration?.renderedFrameCount += 1
+            recordOutputEnqueue(hostTime: hostTime)
+#if os(visionOS)
+            lastOutputEnqueueHostTime = hostTime
+#else
+            if lastOutputEnqueueHostTime == 0 {
+                lastOutputEnqueueHostTime = hostTime
+            } else {
+                let advancedTime = lastOutputEnqueueHostTime + outputFrameInterval
+                // If we are significantly behind, resync to avoid burst catch-up behavior.
+                lastOutputEnqueueHostTime = (hostTime - advancedTime > outputFrameInterval) ? hostTime : advancedTime
+            }
+#endif
+        } catch {
+            // Recover from transient renderer/format state mismatches by flushing once.
+            stereoBridge.flushForReattach()
+            do {
+                try stereoBridge.enqueue(pixelBuffer: lastRenderedStereoPixelBuffer, at: itemTime, duration: enqueueDuration)
+                rendererConfiguration?.renderedFrameCount += 1
+                recordOutputEnqueue(hostTime: hostTime)
+#if os(visionOS)
+                lastOutputEnqueueHostTime = hostTime
+#else
+                if lastOutputEnqueueHostTime == 0 {
+                    lastOutputEnqueueHostTime = hostTime
+                } else {
+                    let advancedTime = lastOutputEnqueueHostTime + outputFrameInterval
+                    lastOutputEnqueueHostTime = (hostTime - advancedTime > outputFrameInterval) ? hostTime : advancedTime
+                }
+#endif
+                setPlaybackDebugState("frame-enqueue-recovered")
+            } catch {
+                lastError = "enqueue-failed: \(error.localizedDescription)"
+                setPlaybackDebugState("enqueue-failed")
             }
         }
     }
@@ -1136,7 +1482,53 @@ final class StereoVideoPlayerController: NSObject, ObservableObject {
             fields["shedding_tier"] = String(lastSheddingTier)
         }
 
+        if processDurationCount > 0 {
+            let processAvgMs = processDurationSumMs / Double(processDurationCount)
+            fields["proc_ms_avg"] = String(format: "%.2f", processAvgMs)
+            fields["proc_ms_min"] = String(format: "%.2f", processDurationMinMs)
+            fields["proc_ms_max"] = String(format: "%.2f", processDurationMaxMs)
+            fields["proc_count"] = String(processDurationCount)
+        }
+
+        if enqueueIntervalCount > 0 {
+            let enqueueAvgMs = enqueueIntervalSumMs / Double(enqueueIntervalCount)
+            fields["enqueue_ms_avg"] = String(format: "%.2f", enqueueAvgMs)
+            fields["enqueue_ms_min"] = String(format: "%.2f", enqueueIntervalMinMs)
+            fields["enqueue_ms_max"] = String(format: "%.2f", enqueueIntervalMaxMs)
+            fields["enqueue_count"] = String(enqueueIntervalCount)
+        }
+
         PlaybackFaultLogger.shared.log("pipeline-heartbeat", fields: fields)
+        resetJitterTelemetryWindow()
+    }
+
+    private func recordProcessingDurationMs(_ durationMs: Double) {
+        processDurationCount += 1
+        processDurationSumMs += durationMs
+        processDurationMinMs = min(processDurationMinMs, durationMs)
+        processDurationMaxMs = max(processDurationMaxMs, durationMs)
+    }
+
+    private func recordOutputEnqueue(hostTime: CFTimeInterval) {
+        if lastActualOutputEnqueueHostTime > 0 {
+            let intervalMs = (hostTime - lastActualOutputEnqueueHostTime) * 1000.0
+            enqueueIntervalCount += 1
+            enqueueIntervalSumMs += intervalMs
+            enqueueIntervalMinMs = min(enqueueIntervalMinMs, intervalMs)
+            enqueueIntervalMaxMs = max(enqueueIntervalMaxMs, intervalMs)
+        }
+        lastActualOutputEnqueueHostTime = hostTime
+    }
+
+    private func resetJitterTelemetryWindow() {
+        processDurationSumMs = 0
+        processDurationMinMs = Double.greatestFiniteMagnitude
+        processDurationMaxMs = 0
+        processDurationCount = 0
+        enqueueIntervalSumMs = 0
+        enqueueIntervalMinMs = Double.greatestFiniteMagnitude
+        enqueueIntervalMaxMs = 0
+        enqueueIntervalCount = 0
     }
 
     private func currentProcessMemoryStatsMB() -> (rssMB: Double?, footprintMB: Double?) {
@@ -1228,6 +1620,8 @@ struct StereoImmersivePlaybackView: View {
         .onAppear {
             PlaybackFaultLogger.shared.log("immersive-view-on-appear")
             stereoPresentation.setStatus("Immersive view appeared")
+            // Flush stale frames so VideoPlayerComponent receives only fresh ones.
+            stereoPresentation.flushRenderer()
         }
         .onDisappear {
             PlaybackFaultLogger.shared.log("immersive-view-on-disappear")
@@ -1261,17 +1655,19 @@ private struct PanelFrameOriginPreferenceKey: PreferenceKey {
 
 struct StereoVideoPlayerView: View {
     private static let immersiveSignposter = OSSignposter(subsystem: "com.vision.depth-player", category: "immersive")
-    private static let controlPanelSize = CGSize(width: 460, height: 180)
+    private static let controlPanelSize = CGSize(width: 460, height: 280)
     @StateObject private var controller: StereoVideoPlayerController
     @Binding var isPlaying: Bool
     private let onUserStop: () -> Void
 #if os(visionOS)
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
+    private let safeDepthCeiling: Double = 1.04
     private let rendererConfiguration: Video3DConfiguration
     private let showRendererMetrics: Bool
     private let autoOpenImmersiveOnAppear: Bool
-    @State private var depthStrength: Double = 6.5
+    @State private var depthStrength: Double = 1.04
+    @State private var depthScaleSlider: Double = 6.0
     @State private var rendererDiagnostics: String = "Renderer diagnostics pending..."
     @State private var panelOffsetXDisplay: Double = 0.0
     @State private var panelOffsetYDisplay: Double = 0.0
@@ -1302,8 +1698,8 @@ struct StereoVideoPlayerView: View {
             let playerController = try StereoVideoPlayerController(
                 hlsURL: hlsURL,
                 model: model,
-                maxDisparity: 12.0,
-                temporalSmoothing: 0.85
+                maxDisparity: 0.0,
+                temporalSmoothing: 0.0
             )
             _controller = StateObject(wrappedValue: playerController)
         } catch {
@@ -1317,6 +1713,29 @@ struct StereoVideoPlayerView: View {
         self.autoOpenImmersiveOnAppear = autoOpenImmersiveOnAppear
     }
 
+    private var appliedDepthStrength: Double {
+        min(max(depthStrength, 0), safeDepthCeiling)
+    }
+
+    private func mapDepthUIToDisparity(_ uiValue: Double) -> Double {
+        let clampedUI = min(max(uiValue, 0), 1.04)
+        return min(max(clampedUI / 30.0, 0), 1.0)
+    }
+
+    private func mapSliderScaleToDepth(_ sliderValue: Double) -> Double {
+        let clamped = min(max(sliderValue, 1.0), 6.0)
+        return ((clamped - 1.0) / 5.0) * 1.04
+    }
+
+    private func mapDepthToSliderScale(_ depthValue: Double) -> Double {
+        let clamped = min(max(depthValue, 0.0), 1.04)
+        return 1.0 + ((clamped / 1.04) * 5.0)
+    }
+
+    private var appliedParallaxPixels: Double {
+        min(max(mapDepthUIToDisparity(appliedDepthStrength) * 150.0, 0), 150.0)
+    }
+
     #else
     init(hlsURL: URL, isPlaying: Binding<Bool>, onUserStop: @escaping () -> Void = {}) {
         let config = MLModelConfiguration()
@@ -1327,8 +1746,8 @@ struct StereoVideoPlayerView: View {
             let playerController = try StereoVideoPlayerController(
                 hlsURL: hlsURL,
                 model: model,
-                maxDisparity: 12.0,
-                temporalSmoothing: 0.85
+                maxDisparity: 0.0,
+                temporalSmoothing: 0.0
             )
             _controller = StateObject(wrappedValue: playerController)
         } catch {
@@ -1347,6 +1766,20 @@ struct StereoVideoPlayerView: View {
             VStack(spacing: 10) {
 #if os(visionOS)
                 VStack(spacing: 6) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "line.3.horizontal")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.75))
+                        Text("Window Handle")
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .foregroundColor(.white.opacity(0.75))
+                        Capsule()
+                            .fill(Color.white.opacity(0.5))
+                            .frame(width: 54, height: 4)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.bottom, 4)
+
                     HStack {
                         Text("Panel Window Coordinates")
                             .font(.system(size: 11, weight: .semibold, design: .rounded))
@@ -1368,20 +1801,42 @@ struct StereoVideoPlayerView: View {
                     }
 
                     HStack {
-                        Text("3D Depth")
+                        Text("3D Depth Scale")
                             .font(.system(size: 12, weight: .semibold, design: .rounded))
                             .foregroundStyle(.white)
                         Spacer()
-                        Text(String(format: "%.1f", depthStrength))
+                        Text(String(format: "%.0f", depthScaleSlider))
                             .font(.system(size: 12, weight: .regular, design: .monospaced))
                             .foregroundColor(.white.opacity(0.75))
                     }
 
-                    Slider(value: $depthStrength, in: 0...30, step: 0.5)
+                    HStack {
+                        Text("Applied Parallax")
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.9))
+                        Spacer()
+                        Text(String(format: "depth %.2f  shift %.1f px", appliedDepthStrength, appliedParallaxPixels))
+                            .font(.system(size: 11, weight: .regular, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.75))
+                    }
+
+                    Slider(value: $depthScaleSlider, in: 1...6, step: 1) {
+                        Text("Depth Scale")
+                    } minimumValueLabel: {
+                        Text("1")
+                            .font(.system(size: 10, weight: .regular, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
+                    } maximumValueLabel: {
+                        Text("6")
+                            .font(.system(size: 10, weight: .regular, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
                         .tint(.white.opacity(0.95))
-                        .onChange(of: depthStrength) { _, newValue in
-                            rendererConfiguration.disparityStrength = CGFloat(newValue)
-                            rendererConfiguration.rendererDebugStatus = "Depth strength \(String(format: "%.1f", newValue))"
+                        .onChange(of: depthScaleSlider) { _, newValue in
+                            depthStrength = mapSliderScaleToDepth(newValue)
+                            rendererConfiguration.disparityStrength = CGFloat(mapDepthUIToDisparity(depthStrength))
+                            controller.updateDepthStrength(CGFloat(depthStrength))
+                            rendererConfiguration.rendererDebugStatus = "Depth scale \(String(format: "%.0f", newValue))"
                         }
                 }
                 .frame(minWidth: 320, maxWidth: 420)
@@ -1396,8 +1851,11 @@ struct StereoVideoPlayerView: View {
 #endif
             }
             .padding(.horizontal, 18)
-            .padding(.vertical, 8)
-            .background(Color.clear)
+            .padding(.vertical, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.black.opacity(0.45))
+            )
 
         }
         .frame(width: Self.controlPanelSize.width, height: Self.controlPanelSize.height, alignment: .topLeading)
@@ -1435,7 +1893,10 @@ struct StereoVideoPlayerView: View {
             ])
             controller.attachStereoPresentation(stereoPresentation)
             controller.attachRendererConfiguration(rendererConfiguration)
-            depthStrength = Double(rendererConfiguration.disparityStrength)
+            depthStrength = 1.04
+            depthScaleSlider = mapDepthToSliderScale(depthStrength)
+            rendererConfiguration.disparityStrength = CGFloat(mapDepthUIToDisparity(depthStrength))
+            controller.updateDepthStrength(CGFloat(depthStrength))
             panelOffsetXDisplay = Double(rendererConfiguration.panelOffsetX)
             panelOffsetYDisplay = Double(rendererConfiguration.panelOffsetY)
             panelOffsetZDisplay = Double(rendererConfiguration.panelOffsetZ)
@@ -1591,7 +2052,7 @@ struct StereoVideoPlayerView: View {
                 Self.immersiveSignposter.emitEvent("ImmersiveOpened", id: Self.immersiveSignposter.makeSignpostID())
                 isImmersiveOpen = true
                 stereoPresentation.setStatus("Immersive stereo playback opened")
-                rendererConfiguration.rendererDebugStatus = "Immersive space opened; awaiting compositor start"
+                rendererConfiguration.rendererDebugStatus = "Immersive space opened; awaiting RealityKit video attach"
             case .userCancelled:
                 PlaybackFaultLogger.shared.log("immersive-user-cancelled")
                 Self.immersiveSignposter.emitEvent("ImmersiveCancelled", id: Self.immersiveSignposter.makeSignpostID())

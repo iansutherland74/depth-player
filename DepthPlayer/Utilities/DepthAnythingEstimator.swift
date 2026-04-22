@@ -18,6 +18,11 @@ enum DepthAnythingModelLoader {
 final class DepthAnythingEstimator {
     private let request: VNCoreMLRequest
     private let ciContext = CIContext()
+    private let maxInferenceDimension = 640
+    private var inferencePixelBufferPool: CVPixelBufferPool?
+    private var inferencePoolWidth = 0
+    private var inferencePoolHeight = 0
+    private var inferencePoolPixelFormat: OSType = 0
 
     init(model: MLModel) throws {
         let vnModel = try VNCoreMLModel(for: model)
@@ -31,7 +36,8 @@ final class DepthAnythingEstimator {
 
     /// Runs depth inference on a CVPixelBuffer and returns the depth map as MLMultiArray.
     func predictDepth(pixelBuffer: CVPixelBuffer) throws -> MLMultiArray {
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
+        let inferencePixelBuffer = try makeInferencePixelBuffer(from: pixelBuffer)
+        let handler = VNImageRequestHandler(cvPixelBuffer: inferencePixelBuffer, orientation: .up)
         try handler.perform([request])
 
         guard let result = request.results?.first else {
@@ -53,6 +59,86 @@ final class DepthAnythingEstimator {
         }
 
         throw DepthEstimatorError.unsupportedObservation(String(describing: type(of: result)))
+    }
+
+    private func makeInferencePixelBuffer(from pixelBuffer: CVPixelBuffer) throws -> CVPixelBuffer {
+        let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
+        let longestEdge = max(sourceWidth, sourceHeight)
+
+        guard longestEdge > maxInferenceDimension else {
+            return pixelBuffer
+        }
+
+        let scale = Double(maxInferenceDimension) / Double(longestEdge)
+        var targetWidth = max(1, Int((Double(sourceWidth) * scale).rounded()))
+        var targetHeight = max(1, Int((Double(sourceHeight) * scale).rounded()))
+
+        // Keep dimensions even to avoid odd-size edge cases in downstream kernels.
+        targetWidth -= targetWidth % 2
+        targetHeight -= targetHeight % 2
+        if targetWidth <= 0 { targetWidth = 2 }
+        if targetHeight <= 0 { targetHeight = 2 }
+
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        if inferencePixelBufferPool == nil ||
+            inferencePoolWidth != targetWidth ||
+            inferencePoolHeight != targetHeight ||
+            inferencePoolPixelFormat != pixelFormat {
+            let pixelAttributes: [CFString: Any] = [
+                kCVPixelBufferWidthKey: targetWidth,
+                kCVPixelBufferHeightKey: targetHeight,
+                kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+                kCVPixelBufferIOSurfacePropertiesKey: [:],
+                kCVPixelBufferMetalCompatibilityKey: true,
+            ]
+
+            let poolAttributes: [CFString: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey: 2,
+                kCVPixelBufferPoolAllocationThresholdKey: 4,
+            ]
+
+            var pool: CVPixelBufferPool?
+            let status = CVPixelBufferPoolCreate(
+                kCFAllocatorDefault,
+                poolAttributes as CFDictionary,
+                pixelAttributes as CFDictionary,
+                &pool
+            )
+            guard status == kCVReturnSuccess, let pool else {
+                throw DepthEstimatorError.imageCreationFailed
+            }
+
+            inferencePixelBufferPool = pool
+            inferencePoolWidth = targetWidth
+            inferencePoolHeight = targetHeight
+            inferencePoolPixelFormat = pixelFormat
+        }
+
+        guard let pool = inferencePixelBufferPool else {
+            throw DepthEstimatorError.imageCreationFailed
+        }
+
+        var output: CVPixelBuffer?
+        let allocStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output)
+        guard allocStatus == kCVReturnSuccess, let output else {
+            return pixelBuffer
+        }
+
+        let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let scaledImage = sourceImage.transformed(by: CGAffineTransform(
+            scaleX: CGFloat(targetWidth) / CGFloat(sourceWidth),
+            y: CGFloat(targetHeight) / CGFloat(sourceHeight)
+        ))
+
+        ciContext.render(
+            scaledImage,
+            to: output,
+            bounds: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight),
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
+        )
+
+        return output
     }
 
     /// Helper to render an MLMultiArray depth map into a displayable grayscale CIImage.

@@ -51,6 +51,12 @@
 			path = "DepthPlayer/Utilities/AppleDiagnostics.swift";
 			sourceTree = SOURCE_ROOT;
 		};
+		641C00522C7264B800D4C3A1 /* Video3DConfiguration.swift */ = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = "DepthPlayer/Utilities/Video3DConfiguration.swift";
+			sourceTree = SOURCE_ROOT;
+		};
 		641C00152C7264B800D4C3A1 /* Info.plist */ = {
 			isa = PBXFileReference;
 			lastKnownFileType = text.plist.xml;
@@ -62,73 +68,6 @@
 			lastKnownFileType = folder.assetcatalog;
 			path = "DepthPlayer/Assets.xcassets";
 			sourceTree = SOURCE_ROOT;
-		};
-		641C00312C7264B800D4C3A1 /* Bridging.h */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = sourcecode.c.h;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/Bridging.h";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C00322C7264B800D4C3A1 /* VideoRendererBridge.mm */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = sourcecode.cpp.objcpp;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/VideoRendererBridge.mm";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C00342C7264B800D4C3A1 /* VideoRendererBridge.h */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = sourcecode.c.h;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/VideoRendererBridge.h";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C00352C7264B800D4C3A1 /* Mesh.mm */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = sourcecode.cpp.objcpp;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/Mesh.mm";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C00372C7264B800D4C3A1 /* Mesh.h */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = sourcecode.c.h;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/Mesh.h";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C00382C7264B800D4C3A1 /* SpatialRenderer.mm */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = sourcecode.cpp.objcpp;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/SpatialRenderer.mm";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C003A2C7264B800D4C3A1 /* SpatialRenderer.h */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = sourcecode.c.h;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/SpatialRenderer.h";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C003B2C7264B800D4C3A1 /* ShaderTypes.h */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = sourcecode.c.h;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/ShaderTypes.h";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C003C2C7264B800D4C3A1 /* SceneShaders.metal */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = sourcecode.metal;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/SceneShaders.metal";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C003E2C7264B800D4C3A1 /* bluemarble.png */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = image.png;
-			path = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/bluemarble.png";
-			sourceTree = SOURCE_ROOT;
-		};
-		641C00402C7264B800D4C3A1 /* CompositorServices.framework */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = wrapper.framework;
-			name = CompositorServices.framework;
-			path = System/Library/Frameworks/CompositorServices.framework;
-			sourceTree = SDKROOT;
 		};
 		641C00422C7264B800D4C3A1 /* Metal.framework */ = {
 			isa = PBXFileReference;
@@ -190,10 +129,7 @@
 				641C00232C7264B800D4C3A1,
 				641C004B2C7264B800D4C3A1,
 				641C00512C7264B800D4C3A1,
-				641C00332C7264B800D4C3A1,
-				641C00362C7264B800D4C3A1,
-				641C00392C7264B800D4C3A1,
-				641C003D2C7264B800D4C3A1,
+				641C00532C7264B800D4C3A1,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -201,7 +137,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				641C00412C7264B800D4C3A1,
 				641C00432C7264B800D4C3A1,
 				641C00452C7264B800D4C3A1,
 				641C00472C7264B800D4C3A1,
@@ -215,7 +150,6 @@
 			files = (
 				641C000A2C7264B800D4C3A1,
 				641C00252C7264B800D4C3A1,
-				641C003F2C7264B800D4C3A1,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -246,7 +180,6 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;
 				SUPPORTED_PLATFORMS = "xros xrsimulator";
-				SWIFT_OBJC_BRIDGING_HEADER = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/Bridging.h";
 				SWIFT_VERSION = 6.2;
 				TARGETED_DEVICE_FAMILY = 7;
 				XROS_DEPLOYMENT_TARGET = 26.0;
@@ -271,7 +204,6 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;
 				SUPPORTED_PLATFORMS = "xros xrsimulator";
-				SWIFT_OBJC_BRIDGING_HEADER = "../Metal-2d-to-3d-Convertor-example/ImmersiveMetal/ImmersiveMetal/Bridging.h";
 				SWIFT_VERSION = 6.2;
 				TARGETED_DEVICE_FAMILY = 7;
 				XROS_DEPLOYMENT_TARGET = 26.0;
@@ -319,19 +251,9 @@
 				641C00142C7264B800D4C3A1,
 				641C004A2C7264B800D4C3A1,
 				641C00502C7264B800D4C3A1,
+				641C00522C7264B800D4C3A1,
 				641C00152C7264B800D4C3A1,
 				641C00162C7264B800D4C3A1,
-				641C00312C7264B800D4C3A1,
-				641C00322C7264B800D4C3A1,
-				641C00342C7264B800D4C3A1,
-				641C00352C7264B800D4C3A1,
-				641C00372C7264B800D4C3A1,
-				641C00382C7264B800D4C3A1,
-				641C003A2C7264B800D4C3A1,
-				641C003B2C7264B800D4C3A1,
-				641C003C2C7264B800D4C3A1,
-				641C003E2C7264B800D4C3A1,
-				641C00402C7264B800D4C3A1,
 				641C00422C7264B800D4C3A1,
 				641C00442C7264B800D4C3A1,
 				641C00462C7264B800D4C3A1,
@@ -372,29 +294,9 @@
 			isa = PBXBuildFile;
 			fileRef = 641C00502C7264B800D4C3A1;
 		};
-		641C00332C7264B800D4C3A1 /* PBXBuildFile */ = {
+		641C00532C7264B800D4C3A1 /* PBXBuildFile */ = {
 			isa = PBXBuildFile;
-			fileRef = 641C00322C7264B800D4C3A1;
-		};
-		641C00362C7264B800D4C3A1 /* PBXBuildFile */ = {
-			isa = PBXBuildFile;
-			fileRef = 641C00352C7264B800D4C3A1;
-		};
-		641C00392C7264B800D4C3A1 /* PBXBuildFile */ = {
-			isa = PBXBuildFile;
-			fileRef = 641C00382C7264B800D4C3A1;
-		};
-		641C003D2C7264B800D4C3A1 /* PBXBuildFile */ = {
-			isa = PBXBuildFile;
-			fileRef = 641C003C2C7264B800D4C3A1;
-		};
-		641C003F2C7264B800D4C3A1 /* PBXBuildFile */ = {
-			isa = PBXBuildFile;
-			fileRef = 641C003E2C7264B800D4C3A1;
-		};
-		641C00412C7264B800D4C3A1 /* PBXBuildFile */ = {
-			isa = PBXBuildFile;
-			fileRef = 641C00402C7264B800D4C3A1;
+			fileRef = 641C00522C7264B800D4C3A1;
 		};
 		641C00432C7264B800D4C3A1 /* PBXBuildFile */ = {
 			isa = PBXBuildFile;
